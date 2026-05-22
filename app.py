@@ -1,32 +1,30 @@
 from flask import Flask, jsonify, render_template, request, send_file
 
-from scraper import get_zip_file, reveal_folder, save_cookies, scrape_images
+from scraper import get_zip_file, is_logged_in, reveal_folder, scrape_images, setup_login
 
 app = Flask(__name__)
 
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", logged_in=is_logged_in())
 
 
-@app.route("/cookies", methods=["POST"])
-def cookies_route():
-    data = request.get_json(silent=True) or {}
-    cookies_json = data.get("cookies", "")
-    if not cookies_json.strip():
-        return jsonify({"ok": False, "error": "Cookie JSON is required."}), 400
-
-    result = save_cookies(cookies_json)
-    status = 200 if result.get("ok") else 400
-    return jsonify(result), status
+@app.route("/login")
+def login_route():
+    result = setup_login()
+    return render_template(
+        "index.html",
+        logged_in=is_logged_in(),
+        setup_message=result.get("message") if result.get("ok") else None,
+        setup_error=result.get("error") if not result.get("ok") else None,
+    )
 
 
 @app.route("/scrape", methods=["POST"])
 def scrape_route():
     data = request.get_json(silent=True) or {}
     url = data.get("url", "").strip()
-
     if not url:
         return jsonify({"ok": False, "error": "URL is required."}), 400
 

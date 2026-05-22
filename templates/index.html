@@ -24,15 +24,6 @@
       border-radius: 8px;
       font-size: 1rem;
     }
-    textarea {
-      width: 100%;
-      min-height: 100px;
-      padding: 10px 12px;
-      border: 1px solid #ccc;
-      border-radius: 8px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 0.85rem;
-    }
     button, .btn {
       padding: 10px 16px;
       border: none;
@@ -45,14 +36,10 @@
       display: inline-block;
     }
     button:disabled { opacity: 0.6; cursor: wait; }
-    .cookies { margin-top: 24px; }
-    .cookies summary { cursor: pointer; color: #0066cc; }
-    .cookies p { color: #555; font-size: 0.9rem; }
-    .message {
-      margin-top: 20px;
-      padding: 12px 16px;
-      border-radius: 8px;
-    }
+    .login-row { margin-top: 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .login-row a { color: #0066cc; }
+    .badge { font-size: 0.85rem; color: #145a1e; background: #eefaf0; padding: 4px 8px; border-radius: 6px; }
+    .message { margin-top: 20px; padding: 12px 16px; border-radius: 8px; }
     .message.info { background: #eef6ff; color: #004080; }
     .message.success { background: #eefaf0; color: #145a1e; }
     .message.error { background: #fff0f0; color: #8b0000; }
@@ -68,22 +55,25 @@
 </head>
 <body>
   <h1>News Image Scraper</h1>
-  <p class="sub">Paste a news article URL to save all its images to a folder.</p>
+  <p class="sub">Pulls <code>&lt;img&gt;</code> tags from the page — like Inspect Element.</p>
+
+  {% if setup_message %}
+  <div class="message success">{{ setup_message }}</div>
+  {% endif %}
+  {% if setup_error %}
+  <div class="message error">{{ setup_error }}</div>
+  {% endif %}
+
+  <div class="login-row">
+    <a href="/login">Log in</a>
+    <span>— sign into NYT, WSJ, WaPo first (opens a browser window)</span>
+    {% if logged_in %}<span class="badge">Logged in</span>{% endif %}
+  </div>
 
   <form id="scrape-form">
     <input type="url" id="url" name="url" placeholder="https://www.nytimes.com/..." required>
     <button type="submit" id="submit-btn">Scrape images</button>
   </form>
-
-  <details class="cookies">
-    <summary>Subscriber cookies (NYT, WSJ, WaPo)</summary>
-    <p>Export cookies from your browser (EditThisCookie, Cookie-Editor, etc.) while logged in, paste the JSON array here, and save once.</p>
-    <textarea id="cookies" placeholder='[{"name":"...", "value":"...", "domain":".nytimes.com"}]'></textarea>
-    <div class="actions">
-      <button type="button" id="save-cookies-btn">Save cookies</button>
-    </div>
-    <div id="cookie-status"></div>
-  </details>
 
   <div id="status"></div>
 
@@ -91,28 +81,6 @@
     const form = document.getElementById("scrape-form");
     const statusEl = document.getElementById("status");
     const submitBtn = document.getElementById("submit-btn");
-    const saveCookiesBtn = document.getElementById("save-cookies-btn");
-    const cookieStatusEl = document.getElementById("cookie-status");
-
-    saveCookiesBtn.addEventListener("click", async () => {
-      const cookies = document.getElementById("cookies").value.trim();
-      if (!cookies) return;
-
-      saveCookiesBtn.disabled = true;
-      try {
-        const res = await fetch("/cookies", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cookies }),
-        });
-        const data = await res.json();
-        cookieStatusEl.innerHTML = `<div class="message ${data.ok ? "success" : "error"}">${data.message || data.error}</div>`;
-      } catch (err) {
-        cookieStatusEl.innerHTML = `<div class="message error">${err.message}</div>`;
-      } finally {
-        saveCookiesBtn.disabled = false;
-      }
-    });
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -131,12 +99,9 @@
         const data = await res.json();
 
         if (data.ok) {
-          let actions = "";
-          if (data.zip_url) {
-            actions = `<div class="actions"><a class="btn secondary" href="${data.zip_url}">Download zip</a></div>`;
-          } else {
-            actions = `<div class="actions"><button type="button" class="btn secondary" id="reveal-btn">Reveal in Finder</button></div>`;
-          }
+          let actions = data.zip_url
+            ? `<div class="actions"><a class="btn secondary" href="${data.zip_url}">Download zip</a></div>`
+            : `<div class="actions"><button type="button" class="btn secondary" id="reveal-btn">Reveal in Finder</button></div>`;
 
           statusEl.innerHTML = `
             <div class="message success">
@@ -147,8 +112,8 @@
 
           const revealBtn = document.getElementById("reveal-btn");
           if (revealBtn) {
-            revealBtn.addEventListener("click", async () => {
-              await fetch("/reveal/" + encodeURIComponent(data.folder_id));
+            revealBtn.addEventListener("click", () => {
+              fetch("/reveal/" + encodeURIComponent(data.folder_id));
             });
           }
         } else {

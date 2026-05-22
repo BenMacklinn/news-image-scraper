@@ -3,7 +3,10 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -12,70 +15,16 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE_DIR = Path(__file__).resolve().parent
-
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+MAX_IMAGES = 60
+DOWNLOAD_TIMEOUT = 8
+DOWNLOAD_WORKERS = 8
 
-SKIP_URL_PATTERN = re.compile(
-    r"(favicon|pixel\.gif|1x1|spacer|tracking|doubleclick|facebook\.com/tr|"
-    r"google-analytics|scorecardresearch|beacon|/ads/|/ad/|advert)",
-    re.I,
-)
-
-IMAGE_URL_IN_TEXT = re.compile(
-    r'https?://[^\s"\'<>\\]+?\.(?:jpe?g|png|gif|webp|avif|bmp|svg)(?:\?[^\s"\'<>\\]*)?',
-    re.I,
-)
-
-CDN_IMAGE_IN_TEXT = re.compile(
-    r'https?://[^\s"\'<>\\]*(?:images?|media|static|cdn|graphics|photos?|'
-    r"img|dam\.|cloudfront)[^\s\"'<>\\]*",
-    re.I,
-)
-
-BACKGROUND_IMAGE = re.compile(
-    r"""background-image:\s*url\(\s*['"]?([^'")]+)['"]?\s*\)""",
-    re.I,
-)
-
-LAZY_ATTRS = (
-    "src",
-    "data-src",
-    "data-lazy-src",
-    "data-original",
-    "data-image",
-    "data-url",
-    "data-hi-res-src",
-    "data-full-src",
-    "data-pin-media",
-    "data-image-url",
-    "data-srcset",
-    "data-lazy-srcset",
-    "data-original-src",
-    "data-retina-src",
-)
-
-JSON_IMAGE_KEYS = (
-    "url",
-    "contentUrl",
-    "thumbnailUrl",
-    "image",
-    "src",
-    "uri",
-    "href",
-    "imageUrl",
-    "mediaUrl",
-    "previewImage",
-    "fullImage",
-    "defaultImage",
-    "largeImage",
-    "promoImage",
-    "poster",
-    "thumbnail",
-    "photo",
-)
+_login_lock = threading.Lock()
+_login_running = False
 
 
 def is_serverless() -> bool:
@@ -83,16 +32,19 @@ def is_serverless() -> bool:
 
 
 def storage_root() -> Path:
-    if is_serverless():
-        root = Path("/tmp/image-scraper")
-    else:
-        root = BASE_DIR
+    root = Path("/tmp/image-scraper") if is_serverless() else BASE_DIR
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def cookies_file() -> Path:
     return storage_root() / "cookies.json"
+
+
+def profile_dir() -> Path:
+    path = storage_root() / ".browser-profile"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def downloads_dir() -> Path:
@@ -109,31 +61,16 @@ def validate_url(url: str) -> str:
     return url
 
 
-def save_cookies(cookies_json: str) -> dict:
-    try:
-        data = json.loads(cookies_json)
-    except json.JSONDecodeError as exc:
-        return {"ok": False, "error": f"Invalid JSON: {exc}"}
-
-    if not isinstance(data, list):
-        return {"ok": False, "error": "Paste a JSON array of cookie objects."}
-
-    for i, cookie in enumerate(data):
-        if not isinstance(cookie, dict) or "name" not in cookie or "value" not in cookie:
-            return {"ok": False, "error": f"Cookie #{i + 1} must have name and value."}
-
-    cookies_file().write_text(json.dumps(data, indent=2))
-    return {"ok": True, "message": f"Saved {len(data)} cookies for subscriber sites."}
+def is_logged_in() -> bool:
+    return cookies_file().exists()
 
 
 def _build_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
-
     path = cookies_file()
     if not path.exists():
         return session
-
     for cookie in json.loads(path.read_text()):
         session.cookies.set(
             cookie["name"],
@@ -142,6 +79,62 @@ def _build_session() -> requests.Session:
             path=cookie.get("path", "/"),
         )
     return session
+
+
+def setup_login() -> dict:
+    global _login_running
+
+    if is_serverless():
+        return {
+            "ok": False,
+            "error": "Login only works when running locally (python app.py on your Mac).",
+        }
+
+    with _login_lock:
+        if _login_running:
+            return {"ok": False, "error": "Login is already in progress."}
+        _login_running = True
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {
+            "ok": False,
+            "error": "Run: pip install playwright && playwright install chromium",
+        }
+
+    try:
+        with sync_playwright() as playwright:
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir()),
+                headless=False,
+                viewport={"width": 1280, "height": 900},
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto("about:blank")
+            page.evaluate(
+                """() => {
+                document.body.innerHTML =
+                    '<div style="font-family:sans-serif;padding:40px;max-width:560px;line-height:1.5">'
+                    + '<h1>Log in to your news sites</h1>'
+                    + '<p>Open new tabs and sign in to NYT, WSJ, WaPo, etc.</p>'
+                    + '<p>When you are done, close this browser window.</p>'
+                    + '</div>';
+            }"""
+            )
+            while context.pages:
+                time.sleep(0.5)
+            cookies = context.cookies()
+            context.close()
+
+        cookies_file().write_text(json.dumps(cookies, indent=2))
+        return {
+            "ok": True,
+            "message": f"Login saved ({len(cookies)} cookies). You can scrape subscriber articles now.",
+        }
+    finally:
+        with _login_lock:
+            _login_running = False
 
 
 def _best_from_srcset(srcset: str):
@@ -168,39 +161,9 @@ def _best_from_srcset(srcset: str):
     return best_url
 
 
-def _all_from_srcset(srcset: str) -> list[str]:
-    urls = []
-    for part in srcset.split(","):
-        bits = part.strip().split()
-        if bits:
-            urls.append(bits[0])
-    return urls
-
-
-def _looks_like_image_url(url: str) -> bool:
-    if not url or url.startswith("data:"):
-        return False
-    if SKIP_URL_PATTERN.search(url):
-        return False
-
-    lower = url.lower()
-    if re.search(r"\.(jpe?g|png|gif|webp|avif|svg|bmp)(\?|$)", url, re.I):
-        return True
-
-    cdn_hints = (
-        "/image", "/images/", "/photo", "/photos/", "/media/", "/picture",
-        "/graphics/", "/dam/", "images.", "media.", "static.", "cdn.",
-        "img.", "cloudfront.net", "wp.com/wp-content/uploads",
-    )
-    return any(hint in lower for hint in cdn_hints)
-
-
 def _normalize_image_key(url: str) -> str:
     parsed = urlparse(url)
     path = re.sub(r"/\d+x\d+/", "/", parsed.path)
-    path = re.sub(r"[-_]\d+w(?=\.)", "", path, flags=re.I)
-    path = re.sub(r"[-_]\d+h(?=\.)", "", path, flags=re.I)
-
     uuid_match = re.search(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         path,
@@ -208,152 +171,56 @@ def _normalize_image_key(url: str) -> str:
     )
     if uuid_match:
         return uuid_match.group(0).lower()
-
     return f"{parsed.netloc}{path.split('?')[0].lower()}"
 
 
-def _collect_json_images(obj, urls: list[str]) -> None:
-    if isinstance(obj, dict):
-        for key in JSON_IMAGE_KEYS:
-            if key not in obj:
-                continue
-            value = obj[key]
-            if isinstance(value, str) and _looks_like_image_url(value):
-                urls.append(value)
-            elif isinstance(value, dict):
-                nested = value.get("url") or value.get("contentUrl") or value.get("uri")
-                if isinstance(nested, str) and _looks_like_image_url(nested):
-                    urls.append(nested)
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, str) and _looks_like_image_url(item):
-                        urls.append(item)
-                    elif isinstance(item, dict):
-                        nested = item.get("url") or item.get("contentUrl") or item.get("uri")
-                        if isinstance(nested, str) and _looks_like_image_url(nested):
-                            urls.append(nested)
-        for value in obj.values():
-            _collect_json_images(value, urls)
-    elif isinstance(obj, list):
-        for item in obj:
-            _collect_json_images(item, urls)
-
-
-def _extract_urls_from_text(text: str, urls: list[str]) -> None:
-    for match in IMAGE_URL_IN_TEXT.findall(text):
-        urls.append(match)
-    for match in CDN_IMAGE_IN_TEXT.findall(text):
-        if _looks_like_image_url(match):
-            urls.append(match.rstrip("\\)]};,"))
-
-
-def _dedupe_urls(raw_urls: list[str], base_url: str) -> list[str]:
-    absolute: list[str] = []
-    seen_keys: set[str] = set()
-    for url in raw_urls:
-        url = url.strip().strip("'\"")
-        if not url or url.startswith("data:"):
-            continue
-        full = urljoin(base_url, url)
-        if not _looks_like_image_url(full):
-            continue
-        key = _normalize_image_key(full)
-        if key not in seen_keys:
-            seen_keys.add(key)
-            absolute.append(full)
-    return absolute
+def _img_url(img):
+    src = img.get("src") or ""
+    if src and not src.startswith("data:"):
+        return src
+    srcset = img.get("srcset")
+    if srcset:
+        return _best_from_srcset(srcset)
+    for attr in ("data-src", "data-lazy-src", "data-original"):
+        value = img.get(attr)
+        if value and not value.startswith("data:"):
+            return value
+    return None
 
 
 def _extract_image_urls(html: str, base_url: str) -> list[str]:
+    """Like Inspect Element: only <img> and <picture> tags."""
     soup = BeautifulSoup(html, "html.parser")
-    raw_urls: list[str] = []
+    raw_urls = []
 
-    def add(url):
+    for img in soup.find_all("img"):
+        url = _img_url(img)
         if url:
-            raw_urls.append(url.strip().strip("'\""))
+            raw_urls.append(url)
 
-    for meta in soup.find_all("meta"):
-        key = (meta.get("property") or meta.get("name") or "").lower()
-        if key.startswith("og:image") or key.startswith("twitter:image") or key == "thumbnail":
-            add(meta.get("content"))
-
-    for link in soup.find_all("link", rel=True):
-        rel = " ".join(link.get("rel", [])).lower()
-        if "preload" in rel and link.get("as") == "image":
-            add(link.get("href"))
-        if "image_src" in rel:
-            add(link.get("href"))
-
-    for tag in soup.find_all(["img", "amp-img", "amp-img-lightbox"]):
-        for attr in LAZY_ATTRS:
-            value = tag.get(attr)
-            if not value:
-                continue
-            if "srcset" in attr:
-                for src in _all_from_srcset(value):
-                    add(src)
-            else:
-                add(value)
-        for attr, value in tag.attrs.items():
-            if not attr.startswith("data-") or not isinstance(value, str):
-                continue
-            if "srcset" in attr:
-                for src in _all_from_srcset(value):
-                    add(src)
-            elif value.startswith("http") or value.startswith("//"):
-                add(value)
-
-    for source in soup.find_all("source"):
+    for source in soup.find_all("picture source"):
         srcset = source.get("srcset")
         if srcset:
-            for src in _all_from_srcset(srcset):
-                add(src)
-        add(source.get("src"))
+            best = _best_from_srcset(srcset)
+            if best:
+                raw_urls.append(best)
 
-    for video in soup.find_all("video"):
-        add(video.get("poster"))
-
-    for tag in soup.find_all(style=True):
-        for match in BACKGROUND_IMAGE.findall(tag.get("style", "")):
-            add(match)
-
-    for style in soup.find_all("style"):
-        if style.string:
-            for match in BACKGROUND_IMAGE.findall(style.string):
-                add(match)
-
-    for script in soup.find_all("script"):
-        content = script.string or script.get_text()
-        if not content:
+    absolute = []
+    seen = set()
+    for url in raw_urls:
+        full = urljoin(base_url, url.strip())
+        if full.startswith("data:"):
             continue
-        if script.get("type") == "application/ld+json":
-            try:
-                _collect_json_images(json.loads(content), raw_urls)
-            except json.JSONDecodeError:
-                pass
-            continue
-        if script.get("id") in ("__NEXT_DATA__", "__PRELOADED_STATE__", "__NUXT__"):
-            try:
-                _collect_json_images(json.loads(content), raw_urls)
-            except json.JSONDecodeError:
-                pass
-        _extract_urls_from_text(content, raw_urls)
-        for json_match in re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", content):
-            snippet = json_match.group(0)
-            if not any(ext in snippet.lower() for ext in (".jpg", ".jpeg", ".png", ".webp", "image")):
-                continue
-            try:
-                _collect_json_images(json.loads(snippet), raw_urls)
-            except json.JSONDecodeError:
-                pass
-
-    _extract_urls_from_text(html, raw_urls)
-    return _dedupe_urls(raw_urls, base_url)
+        key = _normalize_image_key(full)
+        if key not in seen:
+            seen.add(key)
+            absolute.append(full)
+    return absolute[:MAX_IMAGES]
 
 
 def _fetch_page(url: str) -> tuple[str, str, requests.Session]:
     session = _build_session()
-    response = session.get(url, timeout=30, allow_redirects=True)
+    response = session.get(url, timeout=20, allow_redirects=True)
     response.raise_for_status()
     return response.text, str(response.url), session
 
@@ -367,29 +234,38 @@ def _safe_filename(url: str, index: int) -> str:
     return name
 
 
-def _download_images(
-    image_urls: list[str],
-    folder: Path,
-    referer: str,
-    session: requests.Session,
-) -> int:
-    session.headers["Referer"] = referer
-    used_names: set[str] = set()
-    seen_hashes: set[str] = set()
+def _download_one(url: str, referer: str, cookie_jar) -> tuple:
+    try:
+        resp = requests.get(
+            url,
+            timeout=DOWNLOAD_TIMEOUT,
+            headers={"User-Agent": USER_AGENT, "Referer": referer},
+            cookies=cookie_jar,
+        )
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "")
+        if content_type and not content_type.startswith("image/"):
+            return None
+        if len(resp.content) < 1000:
+            return None
+        return url, resp.content
+    except requests.RequestException:
+        return None
+
+
+def _download_images(image_urls: list[str], folder: Path, referer: str, session: requests.Session) -> int:
+    used_names = set()
+    seen_hashes = set()
     count = 0
+    cookie_jar = session.cookies
 
-    for i, url in enumerate(image_urls, start=1):
-        try:
-            resp = session.get(url, timeout=30)
-            resp.raise_for_status()
-            content_type = resp.headers.get("Content-Type", "")
-            if content_type and not content_type.startswith("image/"):
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futures = [pool.submit(_download_one, url, referer, cookie_jar) for url in image_urls]
+        for i, future in enumerate(as_completed(futures), start=1):
+            result = future.result()
+            if not result:
                 continue
-
-            content = resp.content
-            if len(content) < 1500:
-                continue
-
+            url, content = result
             content_hash = hashlib.sha256(content).hexdigest()
             if content_hash in seen_hashes:
                 continue
@@ -401,12 +277,8 @@ def _download_images(
             while filename in used_names:
                 filename = f"{stem}_{i:03d}{suffix}"
             used_names.add(filename)
-
             (folder / filename).write_bytes(content)
             count += 1
-        except requests.RequestException:
-            continue
-
     return count
 
 
@@ -423,7 +295,6 @@ def _resolve_folder(folder_id: str) -> Path:
     folder_id = folder_id.strip().removesuffix(".zip")
     if not folder_id or ".." in folder_id or "/" in folder_id:
         raise ValueError("Invalid folder id")
-
     folder = (downloads_dir() / folder_id).resolve()
     root = downloads_dir().resolve()
     if not str(folder).startswith(str(root)) or not folder.is_dir():
@@ -451,18 +322,14 @@ def scrape_images(url: str) -> dict:
 
     image_urls = _extract_image_urls(html, final_url)
     if not image_urls:
-        has_cookies = cookies_file().exists()
-        message = "No images found in page HTML."
-        if not has_cookies:
-            message += " Paste subscriber cookies below for NYT/WSJ/WaPo articles."
+        message = "No <img> tags found on the page."
+        if not is_logged_in():
+            message += " Click Log in first for subscriber articles."
         return {"ok": False, "error": message}
 
     count = _download_images(image_urls, folder, referer=url, session=session)
     if count == 0:
-        return {
-            "ok": False,
-            "error": "Found image URLs but failed to download any files.",
-        }
+        return {"ok": False, "error": "Found image URLs but could not download any."}
 
     result = {
         "ok": True,
@@ -471,12 +338,10 @@ def scrape_images(url: str) -> dict:
         "folder_id": folder.name,
         "serverless": is_serverless(),
     }
-
     if is_serverless():
         _create_zip(folder)
         result["zip_url"] = f"/download/{folder.name}.zip"
         result["folder"] = f"{count} images ready to download"
-
     return result
 
 
@@ -490,18 +355,12 @@ def get_zip_file(folder_id: str) -> Path:
 
 def reveal_folder(folder_id: str) -> dict:
     if is_serverless():
-        return {
-            "ok": False,
-            "error": "Reveal in Finder is not available on Vercel. Use Download zip instead.",
-        }
-
+        return {"ok": False, "error": "Use Download zip on Vercel."}
     folder = _resolve_folder(folder_id)
-
     if sys.platform == "darwin":
         os.system(f'open "{folder}"')
     elif sys.platform == "win32":
         os.startfile(folder)  # noqa: S606
     else:
         os.system(f'xdg-open "{folder}"')
-
     return {"ok": True, "folder": str(folder)}
