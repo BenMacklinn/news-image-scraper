@@ -19,8 +19,62 @@ USER_AGENT = (
 )
 
 SKIP_URL_PATTERN = re.compile(
-    r"(logo|icon|avatar|pixel|tracking|spacer|badge|button|sprite|favicon|ads?[/\-])",
+    r"(favicon|pixel\.gif|1x1|spacer|tracking|doubleclick|facebook\.com/tr|"
+    r"google-analytics|scorecardresearch|beacon|/ads/|/ad/|advert)",
     re.I,
+)
+
+IMAGE_URL_IN_TEXT = re.compile(
+    r'https?://[^\s"\'<>\\]+?\.(?:jpe?g|png|gif|webp|avif|bmp|svg)(?:\?[^\s"\'<>\\]*)?',
+    re.I,
+)
+
+CDN_IMAGE_IN_TEXT = re.compile(
+    r'https?://[^\s"\'<>\\]*(?:images?|media|static|cdn|graphics|photos?|'
+    r"img|dam\.|cloudfront)[^\s\"'<>\\]*",
+    re.I,
+)
+
+BACKGROUND_IMAGE = re.compile(
+    r"""background-image:\s*url\(\s*['"]?([^'")]+)['"]?\s*\)""",
+    re.I,
+)
+
+LAZY_ATTRS = (
+    "src",
+    "data-src",
+    "data-lazy-src",
+    "data-original",
+    "data-image",
+    "data-url",
+    "data-hi-res-src",
+    "data-full-src",
+    "data-pin-media",
+    "data-image-url",
+    "data-srcset",
+    "data-lazy-srcset",
+    "data-original-src",
+    "data-retina-src",
+)
+
+JSON_IMAGE_KEYS = (
+    "url",
+    "contentUrl",
+    "thumbnailUrl",
+    "image",
+    "src",
+    "uri",
+    "href",
+    "imageUrl",
+    "mediaUrl",
+    "previewImage",
+    "fullImage",
+    "defaultImage",
+    "largeImage",
+    "promoImage",
+    "poster",
+    "thumbnail",
+    "photo",
 )
 
 
@@ -114,16 +168,31 @@ def _best_from_srcset(srcset: str):
     return best_url
 
 
+def _all_from_srcset(srcset: str) -> list[str]:
+    urls = []
+    for part in srcset.split(","):
+        bits = part.strip().split()
+        if bits:
+            urls.append(bits[0])
+    return urls
+
+
 def _looks_like_image_url(url: str) -> bool:
     if not url or url.startswith("data:"):
         return False
     if SKIP_URL_PATTERN.search(url):
         return False
-    return bool(
-        re.search(r"\.(jpe?g|png|gif|webp|avif|svg|bmp)(\?|$)", url, re.I)
-        or "/image" in url.lower()
-        or "graphics" in url.lower()
+
+    lower = url.lower()
+    if re.search(r"\.(jpe?g|png|gif|webp|avif|svg|bmp)(\?|$)", url, re.I):
+        return True
+
+    cdn_hints = (
+        "/image", "/images/", "/photo", "/photos/", "/media/", "/picture",
+        "/graphics/", "/dam/", "images.", "media.", "static.", "cdn.",
+        "img.", "cloudfront.net", "wp.com/wp-content/uploads",
     )
+    return any(hint in lower for hint in cdn_hints)
 
 
 def _normalize_image_key(url: str) -> str:
@@ -145,14 +214,14 @@ def _normalize_image_key(url: str) -> str:
 
 def _collect_json_images(obj, urls: list[str]) -> None:
     if isinstance(obj, dict):
-        for key in ("url", "contentUrl", "thumbnailUrl", "image", "src"):
+        for key in JSON_IMAGE_KEYS:
             if key not in obj:
                 continue
             value = obj[key]
             if isinstance(value, str) and _looks_like_image_url(value):
                 urls.append(value)
             elif isinstance(value, dict):
-                nested = value.get("url") or value.get("contentUrl")
+                nested = value.get("url") or value.get("contentUrl") or value.get("uri")
                 if isinstance(nested, str) and _looks_like_image_url(nested):
                     urls.append(nested)
             elif isinstance(value, list):
@@ -160,7 +229,7 @@ def _collect_json_images(obj, urls: list[str]) -> None:
                     if isinstance(item, str) and _looks_like_image_url(item):
                         urls.append(item)
                     elif isinstance(item, dict):
-                        nested = item.get("url") or item.get("contentUrl")
+                        nested = item.get("url") or item.get("contentUrl") or item.get("uri")
                         if isinstance(nested, str) and _looks_like_image_url(nested):
                             urls.append(nested)
         for value in obj.values():
@@ -170,48 +239,21 @@ def _collect_json_images(obj, urls: list[str]) -> None:
             _collect_json_images(item, urls)
 
 
-def _extract_image_urls(html: str, base_url: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    raw_urls: list[str] = []
+def _extract_urls_from_text(text: str, urls: list[str]) -> None:
+    for match in IMAGE_URL_IN_TEXT.findall(text):
+        urls.append(match)
+    for match in CDN_IMAGE_IN_TEXT.findall(text):
+        if _looks_like_image_url(match):
+            urls.append(match.rstrip("\\)]};,"))
 
-    def add(url):
-        if url and not url.startswith("data:"):
-            raw_urls.append(url)
 
-    for meta in soup.find_all("meta"):
-        key = (meta.get("property") or meta.get("name") or "").lower()
-        if key in ("og:image", "og:image:url", "twitter:image", "twitter:image:src"):
-            add(meta.get("content"))
-
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            _collect_json_images(json.loads(script.string or ""), raw_urls)
-        except json.JSONDecodeError:
-            continue
-
-    next_data = soup.find("script", id="__NEXT_DATA__")
-    if next_data and next_data.string:
-        try:
-            _collect_json_images(json.loads(next_data.string), raw_urls)
-        except json.JSONDecodeError:
-            pass
-
-    for img in soup.find_all("img"):
-        srcset = img.get("srcset")
-        if srcset:
-            add(_best_from_srcset(srcset))
-        add(img.get("src"))
-        add(img.get("data-src"))
-        add(img.get("data-lazy-src"))
-
-    for source in soup.find_all("source"):
-        srcset = source.get("srcset")
-        if srcset:
-            add(_best_from_srcset(srcset))
-
+def _dedupe_urls(raw_urls: list[str], base_url: str) -> list[str]:
     absolute: list[str] = []
     seen_keys: set[str] = set()
     for url in raw_urls:
+        url = url.strip().strip("'\"")
+        if not url or url.startswith("data:"):
+            continue
         full = urljoin(base_url, url)
         if not _looks_like_image_url(full):
             continue
@@ -220,6 +262,93 @@ def _extract_image_urls(html: str, base_url: str) -> list[str]:
             seen_keys.add(key)
             absolute.append(full)
     return absolute
+
+
+def _extract_image_urls(html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    raw_urls: list[str] = []
+
+    def add(url):
+        if url:
+            raw_urls.append(url.strip().strip("'\""))
+
+    for meta in soup.find_all("meta"):
+        key = (meta.get("property") or meta.get("name") or "").lower()
+        if key.startswith("og:image") or key.startswith("twitter:image") or key == "thumbnail":
+            add(meta.get("content"))
+
+    for link in soup.find_all("link", rel=True):
+        rel = " ".join(link.get("rel", [])).lower()
+        if "preload" in rel and link.get("as") == "image":
+            add(link.get("href"))
+        if "image_src" in rel:
+            add(link.get("href"))
+
+    for tag in soup.find_all(["img", "amp-img", "amp-img-lightbox"]):
+        for attr in LAZY_ATTRS:
+            value = tag.get(attr)
+            if not value:
+                continue
+            if "srcset" in attr:
+                for src in _all_from_srcset(value):
+                    add(src)
+            else:
+                add(value)
+        for attr, value in tag.attrs.items():
+            if not attr.startswith("data-") or not isinstance(value, str):
+                continue
+            if "srcset" in attr:
+                for src in _all_from_srcset(value):
+                    add(src)
+            elif value.startswith("http") or value.startswith("//"):
+                add(value)
+
+    for source in soup.find_all("source"):
+        srcset = source.get("srcset")
+        if srcset:
+            for src in _all_from_srcset(srcset):
+                add(src)
+        add(source.get("src"))
+
+    for video in soup.find_all("video"):
+        add(video.get("poster"))
+
+    for tag in soup.find_all(style=True):
+        for match in BACKGROUND_IMAGE.findall(tag.get("style", "")):
+            add(match)
+
+    for style in soup.find_all("style"):
+        if style.string:
+            for match in BACKGROUND_IMAGE.findall(style.string):
+                add(match)
+
+    for script in soup.find_all("script"):
+        content = script.string or script.get_text()
+        if not content:
+            continue
+        if script.get("type") == "application/ld+json":
+            try:
+                _collect_json_images(json.loads(content), raw_urls)
+            except json.JSONDecodeError:
+                pass
+            continue
+        if script.get("id") in ("__NEXT_DATA__", "__PRELOADED_STATE__", "__NUXT__"):
+            try:
+                _collect_json_images(json.loads(content), raw_urls)
+            except json.JSONDecodeError:
+                pass
+        _extract_urls_from_text(content, raw_urls)
+        for json_match in re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", content):
+            snippet = json_match.group(0)
+            if not any(ext in snippet.lower() for ext in (".jpg", ".jpeg", ".png", ".webp", "image")):
+                continue
+            try:
+                _collect_json_images(json.loads(snippet), raw_urls)
+            except json.JSONDecodeError:
+                pass
+
+    _extract_urls_from_text(html, raw_urls)
+    return _dedupe_urls(raw_urls, base_url)
 
 
 def _fetch_page(url: str) -> tuple[str, str, requests.Session]:
@@ -258,7 +387,7 @@ def _download_images(
                 continue
 
             content = resp.content
-            if len(content) < 5000:
+            if len(content) < 1500:
                 continue
 
             content_hash = hashlib.sha256(content).hexdigest()
