@@ -101,17 +101,26 @@
         const data = await res.json();
 
         if (data.ok) {
+          let actions = "";
+          if (data.zip_url) {
+            actions = `<div class="actions"><a class="btn secondary" href="${data.zip_url}">Download zip</a></div>`;
+          } else {
+            actions = `<div class="actions"><button type="button" class="btn secondary" id="reveal-btn">Reveal in Finder</button></div>`;
+          }
+
           statusEl.innerHTML = `
             <div class="message success">
               <strong>Saved ${data.count} image${data.count === 1 ? "" : "s"}</strong>
               <div class="folder-path">${data.folder}</div>
-              <div class="actions">
-                <button type="button" class="btn secondary" id="reveal-btn">Reveal in Finder</button>
-              </div>
+              ${actions}
             </div>`;
-          document.getElementById("reveal-btn").addEventListener("click", async () => {
-            await fetch("/reveal/" + encodeURIComponent(data.folder_id));
-          });
+
+          const revealBtn = document.getElementById("reveal-btn");
+          if (revealBtn) {
+            revealBtn.addEventListener("click", async () => {
+              await fetch("/reveal/" + encodeURIComponent(data.folder_id));
+            });
+          }
         } else {
           statusEl.innerHTML = `<div class="message error">${data.error || "Scrape failed."}</div>`;
         }

@@ -1,6 +1,6 @@
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 
-from scraper import reveal_folder, scrape_images, setup_login
+from scraper import get_zip_file, reveal_folder, scrape_images, setup_login
 
 app = Flask(__name__)
 
@@ -43,6 +43,19 @@ def scrape_route():
 
     status = 200 if result.get("ok") else 422
     return jsonify(result), status
+
+
+@app.route("/download/<folder_id>")
+def download_route(folder_id):
+    try:
+        zip_path = get_zip_file(folder_id)
+        return send_file(
+            zip_path,
+            as_attachment=True,
+            download_name=f"{folder_id.removesuffix('.zip')}.zip",
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
 
 
 @app.route("/reveal/<folder_id>")

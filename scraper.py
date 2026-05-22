@@ -1,9 +1,11 @@
 import hashlib
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -12,16 +14,67 @@ import requests
 from playwright.sync_api import sync_playwright
 
 BASE_DIR = Path(__file__).resolve().parent
-PROFILE_DIR = BASE_DIR / ".browser-profile"
-DOWNLOADS_DIR = BASE_DIR / "downloads"
 
 _context_lock = threading.Lock()
 _setup_running = False
 
 
+def is_serverless() -> bool:
+    return bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+
+
+def storage_root() -> Path:
+    if is_serverless():
+        root = Path("/tmp/image-scraper")
+    else:
+        root = BASE_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def profile_dir() -> Path:
+    path = storage_root() / ".browser-profile"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def downloads_dir() -> Path:
+    path = storage_root() / "downloads"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _configure_playwright() -> None:
+    bundled = BASE_DIR / "pw-browsers"
+    if bundled.exists():
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled)
+        return
+
+    if is_serverless():
+        runtime_browsers = Path("/tmp/pw-browsers")
+        runtime_browsers.mkdir(parents=True, exist_ok=True)
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(runtime_browsers)
+
+
+def _ensure_playwright_browsers() -> None:
+    _configure_playwright()
+    browsers_path = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""))
+    if browsers_path.exists() and any(browsers_path.rglob("chrome*")):
+        return
+
+    if not is_serverless():
+        return
+
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=True,
+        env=os.environ.copy(),
+    )
+
+
 def _ensure_dirs():
-    PROFILE_DIR.mkdir(exist_ok=True)
-    DOWNLOADS_DIR.mkdir(exist_ok=True)
+    profile_dir()
+    downloads_dir()
 
 
 def validate_url(url: str) -> str:
@@ -179,13 +232,56 @@ def _make_output_folder(url: str) -> Path:
     domain = urlparse(url).netloc.replace("www.", "")
     domain = re.sub(r"[^\w.\-]", "_", domain)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    folder = DOWNLOADS_DIR / f"{domain}_{timestamp}"
+    folder = downloads_dir() / f"{domain}_{timestamp}"
     folder.mkdir(parents=True, exist_ok=True)
     return folder
 
 
+def _resolve_folder(folder_id: str) -> Path:
+    folder_id = folder_id.strip().removesuffix(".zip")
+    if not folder_id or ".." in folder_id or "/" in folder_id:
+        raise ValueError("Invalid folder id")
+
+    folder = (downloads_dir() / folder_id).resolve()
+    root = downloads_dir().resolve()
+    if not str(folder).startswith(str(root)) or not folder.is_dir():
+        raise ValueError("Folder not found")
+    return folder
+
+
+def _create_zip(folder: Path) -> Path:
+    zip_path = folder.with_suffix(".zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for file_path in folder.iterdir():
+            if file_path.is_file():
+                archive.write(file_path, arcname=file_path.name)
+    return zip_path
+
+
+def _launch_browser(playwright, headless: bool):
+    _ensure_playwright_browsers()
+
+    if is_serverless():
+        browser = playwright.chromium.launch(headless=headless)
+        context = browser.new_context(viewport={"width": 1280, "height": 900})
+        return browser, context
+
+    context = playwright.chromium.launch_persistent_context(
+        user_data_dir=str(profile_dir()),
+        headless=headless,
+        viewport={"width": 1280, "height": 900},
+    )
+    return None, context
+
+
 def setup_login() -> dict:
     global _setup_running
+
+    if is_serverless():
+        return {
+            "ok": False,
+            "error": "Login setup only works locally. Run python app.py on your Mac, then use Set up logins.",
+        }
 
     _ensure_dirs()
 
@@ -196,11 +292,7 @@ def setup_login() -> dict:
 
     try:
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(PROFILE_DIR),
-                headless=False,
-                viewport={"width": 1280, "height": 900},
-            )
+            _, context = _launch_browser(p, headless=False)
             page = context.pages[0] if context.pages else context.new_page()
             page.goto("about:blank")
             page.evaluate(
@@ -228,34 +320,35 @@ def setup_login() -> dict:
 def scrape_images(url: str) -> dict:
     _ensure_dirs()
     url = validate_url(url)
-
     folder = _make_output_folder(url)
+    browser = None
 
     with _context_lock:
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(PROFILE_DIR),
-                headless=True,
-                viewport={"width": 1280, "height": 900},
-            )
+            browser, context = _launch_browser(p, headless=True)
             page = context.new_page()
             try:
                 page.goto(url, wait_until="load", timeout=45000)
             except Exception as exc:
                 context.close()
+                if browser:
+                    browser.close()
                 raise RuntimeError(f"Failed to load page: {exc}") from exc
 
             _scroll_page(page)
             page.wait_for_timeout(2000)
-
             image_urls = _extract_image_urls(page, page.url)
             context.close()
+            if browser:
+                browser.close()
 
     if not image_urls:
-        return {
-            "ok": False,
-            "error": "No images found. Try Set up logins if the article is subscriber-only.",
-        }
+        message = "No images found."
+        if is_serverless():
+            message += " Subscriber articles require running the app locally with Set up logins."
+        else:
+            message += " Try Set up logins if the article is subscriber-only."
+        return {"ok": False, "error": message}
 
     count = _download_images(image_urls, folder, referer=url)
     if count == 0:
@@ -264,25 +357,39 @@ def scrape_images(url: str) -> dict:
             "error": "Found image URLs but failed to download any files.",
         }
 
-    folder_id = folder.name
-    return {
+    result = {
         "ok": True,
         "count": count,
         "folder": str(folder),
-        "folder_id": folder_id,
+        "folder_id": folder.name,
+        "serverless": is_serverless(),
     }
+
+    if is_serverless():
+        zip_path = _create_zip(folder)
+        result["zip_url"] = f"/download/{folder.name}.zip"
+        result["folder"] = f"{count} images ready to download"
+        result["zip_path"] = str(zip_path)
+
+    return result
+
+
+def get_zip_file(folder_id: str) -> Path:
+    folder = _resolve_folder(folder_id)
+    zip_path = folder.with_suffix(".zip")
+    if not zip_path.exists():
+        zip_path = _create_zip(folder)
+    return zip_path
 
 
 def reveal_folder(folder_id: str) -> dict:
-    folder_id = folder_id.strip()
-    if not folder_id or ".." in folder_id or "/" in folder_id:
-        raise ValueError("Invalid folder id")
+    if is_serverless():
+        return {
+            "ok": False,
+            "error": "Reveal in Finder is not available on Vercel. Use Download zip instead.",
+        }
 
-    folder = (DOWNLOADS_DIR / folder_id).resolve()
-    downloads_root = DOWNLOADS_DIR.resolve()
-
-    if not str(folder).startswith(str(downloads_root)) or not folder.is_dir():
-        raise ValueError("Folder not found")
+    folder = _resolve_folder(folder_id)
 
     if sys.platform == "darwin":
         os.system(f'open "{folder}"')
