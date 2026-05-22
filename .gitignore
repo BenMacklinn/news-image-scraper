@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .browser-profile/
+cookies.json
 downloads/
 pw-browsers/
 .DS_Store

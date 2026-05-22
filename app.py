@@ -1,6 +1,6 @@
 from flask import Flask, jsonify, render_template, request, send_file
 
-from scraper import get_zip_file, reveal_folder, scrape_images, setup_login
+from scraper import get_zip_file, reveal_folder, save_cookies, scrape_images
 
 app = Flask(__name__)
 
@@ -10,18 +10,16 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/setup-login")
-def setup_login_route():
-    result = setup_login()
-    if result.get("ok"):
-        return render_template(
-            "index.html",
-            setup_message=result.get("message", "Login setup complete."),
-        )
-    return render_template(
-        "index.html",
-        setup_error=result.get("error", "Login setup failed."),
-    )
+@app.route("/cookies", methods=["POST"])
+def cookies_route():
+    data = request.get_json(silent=True) or {}
+    cookies_json = data.get("cookies", "")
+    if not cookies_json.strip():
+        return jsonify({"ok": False, "error": "Cookie JSON is required."}), 400
+
+    result = save_cookies(cookies_json)
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
 
 
 @app.route("/scrape", methods=["POST"])

@@ -24,6 +24,15 @@
       border-radius: 8px;
       font-size: 1rem;
     }
+    textarea {
+      width: 100%;
+      min-height: 100px;
+      padding: 10px 12px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.85rem;
+    }
     button, .btn {
       padding: 10px 16px;
       border: none;
@@ -36,8 +45,9 @@
       display: inline-block;
     }
     button:disabled { opacity: 0.6; cursor: wait; }
-    .setup { margin-top: 16px; }
-    .setup a { color: #0066cc; }
+    .cookies { margin-top: 24px; }
+    .cookies summary { cursor: pointer; color: #0066cc; }
+    .cookies p { color: #555; font-size: 0.9rem; }
     .message {
       margin-top: 20px;
       padding: 12px 16px;
@@ -52,7 +62,7 @@
       word-break: break-all;
       margin: 8px 0 12px;
     }
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
     .btn.secondary { background: #444; }
   </style>
 </head>
@@ -60,22 +70,20 @@
   <h1>News Image Scraper</h1>
   <p class="sub">Paste a news article URL to save all its images to a folder.</p>
 
-  {% if setup_message %}
-  <div class="message success">{{ setup_message }}</div>
-  {% endif %}
-  {% if setup_error %}
-  <div class="message error">{{ setup_error }}</div>
-  {% endif %}
-
   <form id="scrape-form">
     <input type="url" id="url" name="url" placeholder="https://www.nytimes.com/..." required>
     <button type="submit" id="submit-btn">Scrape images</button>
   </form>
 
-  <div class="setup">
-    <a href="/setup-login">Set up logins</a>
-    — log into NYT, WSJ, WaPo once (opens a browser window)
-  </div>
+  <details class="cookies">
+    <summary>Subscriber cookies (NYT, WSJ, WaPo)</summary>
+    <p>Export cookies from your browser (EditThisCookie, Cookie-Editor, etc.) while logged in, paste the JSON array here, and save once.</p>
+    <textarea id="cookies" placeholder='[{"name":"...", "value":"...", "domain":".nytimes.com"}]'></textarea>
+    <div class="actions">
+      <button type="button" id="save-cookies-btn">Save cookies</button>
+    </div>
+    <div id="cookie-status"></div>
+  </details>
 
   <div id="status"></div>
 
@@ -83,6 +91,28 @@
     const form = document.getElementById("scrape-form");
     const statusEl = document.getElementById("status");
     const submitBtn = document.getElementById("submit-btn");
+    const saveCookiesBtn = document.getElementById("save-cookies-btn");
+    const cookieStatusEl = document.getElementById("cookie-status");
+
+    saveCookiesBtn.addEventListener("click", async () => {
+      const cookies = document.getElementById("cookies").value.trim();
+      if (!cookies) return;
+
+      saveCookiesBtn.disabled = true;
+      try {
+        const res = await fetch("/cookies", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cookies }),
+        });
+        const data = await res.json();
+        cookieStatusEl.innerHTML = `<div class="message ${data.ok ? "success" : "error"}">${data.message || data.error}</div>`;
+      } catch (err) {
+        cookieStatusEl.innerHTML = `<div class="message error">${err.message}</div>`;
+      } finally {
+        saveCookiesBtn.disabled = false;
+      }
+    });
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -90,7 +120,7 @@
       if (!url) return;
 
       submitBtn.disabled = true;
-      statusEl.innerHTML = '<div class="message info">Scraping… this may take a minute.</div>';
+      statusEl.innerHTML = '<div class="message info">Scraping…</div>';
 
       try {
         const res = await fetch("/scrape", {

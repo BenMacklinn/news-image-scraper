@@ -1,22 +1,27 @@
 import hashlib
+import json
 import os
 import re
-import subprocess
 import sys
-import threading
-import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
-from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
 
 BASE_DIR = Path(__file__).resolve().parent
 
-_context_lock = threading.Lock()
-_setup_running = False
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+SKIP_URL_PATTERN = re.compile(
+    r"(logo|icon|avatar|pixel|tracking|spacer|badge|button|sprite|favicon|ads?[/\-])",
+    re.I,
+)
 
 
 def is_serverless() -> bool:
@@ -32,49 +37,14 @@ def storage_root() -> Path:
     return root
 
 
-def profile_dir() -> Path:
-    path = storage_root() / ".browser-profile"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+def cookies_file() -> Path:
+    return storage_root() / "cookies.json"
 
 
 def downloads_dir() -> Path:
     path = storage_root() / "downloads"
     path.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def _configure_playwright() -> None:
-    bundled = BASE_DIR / "pw-browsers"
-    if bundled.exists():
-        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled)
-        return
-
-    if is_serverless():
-        runtime_browsers = Path("/tmp/pw-browsers")
-        runtime_browsers.mkdir(parents=True, exist_ok=True)
-        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(runtime_browsers)
-
-
-def _ensure_playwright_browsers() -> None:
-    _configure_playwright()
-    browsers_path = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""))
-    if browsers_path.exists() and any(browsers_path.rglob("chrome*")):
-        return
-
-    if not is_serverless():
-        return
-
-    subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        check=True,
-        env=os.environ.copy(),
-    )
-
-
-def _ensure_dirs():
-    profile_dir()
-    downloads_dir()
 
 
 def validate_url(url: str) -> str:
@@ -85,72 +55,166 @@ def validate_url(url: str) -> str:
     return url
 
 
+def save_cookies(cookies_json: str) -> dict:
+    try:
+        data = json.loads(cookies_json)
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "error": f"Invalid JSON: {exc}"}
+
+    if not isinstance(data, list):
+        return {"ok": False, "error": "Paste a JSON array of cookie objects."}
+
+    for i, cookie in enumerate(data):
+        if not isinstance(cookie, dict) or "name" not in cookie or "value" not in cookie:
+            return {"ok": False, "error": f"Cookie #{i + 1} must have name and value."}
+
+    cookies_file().write_text(json.dumps(data, indent=2))
+    return {"ok": True, "message": f"Saved {len(data)} cookies for subscriber sites."}
+
+
+def _build_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
+    path = cookies_file()
+    if not path.exists():
+        return session
+
+    for cookie in json.loads(path.read_text()):
+        session.cookies.set(
+            cookie["name"],
+            cookie["value"],
+            domain=cookie.get("domain"),
+            path=cookie.get("path", "/"),
+        )
+    return session
+
+
+def _best_from_srcset(srcset: str):
+    best_url = None
+    best_score = -1
+    for part in srcset.split(","):
+        bits = part.strip().split()
+        if not bits:
+            continue
+        url = bits[0]
+        descriptor = bits[1] if len(bits) > 1 else ""
+        if descriptor.endswith("w"):
+            score = int(descriptor[:-1]) if descriptor[:-1].isdigit() else 0
+        elif descriptor.endswith("x"):
+            try:
+                score = int(float(descriptor[:-1]) * 1000)
+            except ValueError:
+                score = 500
+        else:
+            score = 500
+        if score >= best_score:
+            best_score = score
+            best_url = url
+    return best_url
+
+
+def _looks_like_image_url(url: str) -> bool:
+    if not url or url.startswith("data:"):
+        return False
+    if SKIP_URL_PATTERN.search(url):
+        return False
+    return bool(
+        re.search(r"\.(jpe?g|png|gif|webp|avif|svg|bmp)(\?|$)", url, re.I)
+        or "/image" in url.lower()
+        or "graphics" in url.lower()
+    )
+
+
 def _normalize_image_key(url: str) -> str:
-    """Group resize/crop variants of the same photo under one key."""
     parsed = urlparse(url)
     path = re.sub(r"/\d+x\d+/", "/", parsed.path)
     path = re.sub(r"[-_]\d+w(?=\.)", "", path, flags=re.I)
     path = re.sub(r"[-_]\d+h(?=\.)", "", path, flags=re.I)
 
-    uuid_match = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", path, re.I)
+    uuid_match = re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        path,
+        re.I,
+    )
     if uuid_match:
         return uuid_match.group(0).lower()
 
     return f"{parsed.netloc}{path.split('?')[0].lower()}"
 
 
-def _extract_image_urls(page, base_url: str) -> list[str]:
-    urls = page.evaluate(
-        """() => {
-        const found = [];
-        const seen = new Set();
-        const add = (url) => {
-            if (!url || url.startsWith('data:') || seen.has(url)) return;
-            seen.add(url);
-            found.push(url);
-        };
-        const bestFromSrcset = (srcset) => {
-            if (!srcset) return null;
-            let best = null;
-            let bestScore = -1;
-            for (const part of srcset.split(',')) {
-                const bits = part.trim().split(/\\s+/);
-                const url = bits[0];
-                const descriptor = bits[1] || '';
-                let score = 0;
-                if (descriptor.endsWith('w')) score = parseInt(descriptor, 10) || 0;
-                else if (descriptor.endsWith('x')) score = (parseFloat(descriptor) || 1) * 1000;
-                else score = 500;
-                if (score >= bestScore) {
-                    bestScore = score;
-                    best = url;
-                }
-            }
-            return best;
-        };
+def _collect_json_images(obj, urls: list[str]) -> None:
+    if isinstance(obj, dict):
+        for key in ("url", "contentUrl", "thumbnailUrl", "image", "src"):
+            if key not in obj:
+                continue
+            value = obj[key]
+            if isinstance(value, str) and _looks_like_image_url(value):
+                urls.append(value)
+            elif isinstance(value, dict):
+                nested = value.get("url") or value.get("contentUrl")
+                if isinstance(nested, str) and _looks_like_image_url(nested):
+                    urls.append(nested)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and _looks_like_image_url(item):
+                        urls.append(item)
+                    elif isinstance(item, dict):
+                        nested = item.get("url") or item.get("contentUrl")
+                        if isinstance(nested, str) and _looks_like_image_url(nested):
+                            urls.append(nested)
+        for value in obj.values():
+            _collect_json_images(value, urls)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_json_images(item, urls)
 
-        document.querySelectorAll('img').forEach((img) => {
-            const w = img.naturalWidth || img.width || 0;
-            const h = img.naturalHeight || img.height || 0;
-            if (w > 0 && h > 0 && (w < 120 || h < 120)) return;
 
-            if (img.currentSrc) {
-                add(img.currentSrc);
-                return;
-            }
-            const fromSrcset = bestFromSrcset(img.srcset);
-            if (fromSrcset) add(fromSrcset);
-            else if (img.src) add(img.src);
-        });
+def _extract_image_urls(html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    raw_urls: list[str] = []
 
-        return found;
-    }"""
-    )
+    def add(url):
+        if url and not url.startswith("data:"):
+            raw_urls.append(url)
 
-    absolute = []
-    seen_keys = set()
-    for url in urls:
+    for meta in soup.find_all("meta"):
+        key = (meta.get("property") or meta.get("name") or "").lower()
+        if key in ("og:image", "og:image:url", "twitter:image", "twitter:image:src"):
+            add(meta.get("content"))
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            _collect_json_images(json.loads(script.string or ""), raw_urls)
+        except json.JSONDecodeError:
+            continue
+
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if next_data and next_data.string:
+        try:
+            _collect_json_images(json.loads(next_data.string), raw_urls)
+        except json.JSONDecodeError:
+            pass
+
+    for img in soup.find_all("img"):
+        srcset = img.get("srcset")
+        if srcset:
+            add(_best_from_srcset(srcset))
+        add(img.get("src"))
+        add(img.get("data-src"))
+        add(img.get("data-lazy-src"))
+
+    for source in soup.find_all("source"):
+        srcset = source.get("srcset")
+        if srcset:
+            add(_best_from_srcset(srcset))
+
+    absolute: list[str] = []
+    seen_keys: set[str] = set()
+    for url in raw_urls:
         full = urljoin(base_url, url)
+        if not _looks_like_image_url(full):
+            continue
         key = _normalize_image_key(full)
         if key not in seen_keys:
             seen_keys.add(key)
@@ -158,19 +222,11 @@ def _extract_image_urls(page, base_url: str) -> list[str]:
     return absolute
 
 
-def _scroll_page(page):
-    page.evaluate(
-        """async () => {
-        const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-        const height = document.body.scrollHeight;
-        const steps = 5;
-        for (let i = 1; i <= steps; i++) {
-            window.scrollTo(0, (height / steps) * i);
-            await delay(400);
-        }
-        window.scrollTo(0, 0);
-    }"""
-    )
+def _fetch_page(url: str) -> tuple[str, str, requests.Session]:
+    session = _build_session()
+    response = session.get(url, timeout=30, allow_redirects=True)
+    response.raise_for_status()
+    return response.text, str(response.url), session
 
 
 def _safe_filename(url: str, index: int) -> str:
@@ -182,20 +238,15 @@ def _safe_filename(url: str, index: int) -> str:
     return name
 
 
-def _download_images(image_urls: list[str], folder: Path, referer: str) -> int:
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Referer": referer,
-        }
-    )
-
-    used_names = set()
-    seen_hashes = set()
+def _download_images(
+    image_urls: list[str],
+    folder: Path,
+    referer: str,
+    session: requests.Session,
+) -> int:
+    session.headers["Referer"] = referer
+    used_names: set[str] = set()
+    seen_hashes: set[str] = set()
     count = 0
 
     for i, url in enumerate(image_urls, start=1):
@@ -207,6 +258,9 @@ def _download_images(image_urls: list[str], folder: Path, referer: str) -> int:
                 continue
 
             content = resp.content
+            if len(content) < 5000:
+                continue
+
             content_hash = hashlib.sha256(content).hexdigest()
             if content_hash in seen_hashes:
                 continue
@@ -219,8 +273,7 @@ def _download_images(image_urls: list[str], folder: Path, referer: str) -> int:
                 filename = f"{stem}_{i:03d}{suffix}"
             used_names.add(filename)
 
-            dest = folder / filename
-            dest.write_bytes(content)
+            (folder / filename).write_bytes(content)
             count += 1
         except requests.RequestException:
             continue
@@ -258,99 +311,24 @@ def _create_zip(folder: Path) -> Path:
     return zip_path
 
 
-def _launch_browser(playwright, headless: bool):
-    _ensure_playwright_browsers()
-
-    if is_serverless():
-        browser = playwright.chromium.launch(headless=headless)
-        context = browser.new_context(viewport={"width": 1280, "height": 900})
-        return browser, context
-
-    context = playwright.chromium.launch_persistent_context(
-        user_data_dir=str(profile_dir()),
-        headless=headless,
-        viewport={"width": 1280, "height": 900},
-    )
-    return None, context
-
-
-def setup_login() -> dict:
-    global _setup_running
-
-    if is_serverless():
-        return {
-            "ok": False,
-            "error": "Login setup only works locally. Run python app.py on your Mac, then use Set up logins.",
-        }
-
-    _ensure_dirs()
-
-    with _context_lock:
-        if _setup_running:
-            return {"ok": False, "error": "Login setup is already running."}
-        _setup_running = True
-
-    try:
-        with sync_playwright() as p:
-            _, context = _launch_browser(p, headless=False)
-            page = context.pages[0] if context.pages else context.new_page()
-            page.goto("about:blank")
-            page.evaluate(
-                """() => {
-                document.body.innerHTML = '<div style="font-family:sans-serif;padding:40px;max-width:600px">'
-                    + '<h1>Login setup</h1>'
-                    + '<p>Log into NYT, WSJ, WaPo, and other sites in new tabs.</p>'
-                    + '<p>When finished, close this browser window.</p>'
-                    + '</div>';
-            }"""
-            )
-            while context.pages:
-                time.sleep(0.5)
-            try:
-                context.close()
-            except Exception:
-                pass
-
-        return {"ok": True, "message": "Login setup complete. Sessions saved."}
-    finally:
-        with _context_lock:
-            _setup_running = False
-
-
 def scrape_images(url: str) -> dict:
-    _ensure_dirs()
     url = validate_url(url)
     folder = _make_output_folder(url)
-    browser = None
 
-    with _context_lock:
-        with sync_playwright() as p:
-            browser, context = _launch_browser(p, headless=True)
-            page = context.new_page()
-            try:
-                page.goto(url, wait_until="load", timeout=45000)
-            except Exception as exc:
-                context.close()
-                if browser:
-                    browser.close()
-                raise RuntimeError(f"Failed to load page: {exc}") from exc
+    try:
+        html, final_url, session = _fetch_page(url)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Failed to load page: {exc}") from exc
 
-            _scroll_page(page)
-            page.wait_for_timeout(2000)
-            image_urls = _extract_image_urls(page, page.url)
-            context.close()
-            if browser:
-                browser.close()
-
+    image_urls = _extract_image_urls(html, final_url)
     if not image_urls:
-        message = "No images found."
-        if is_serverless():
-            message += " Subscriber articles require running the app locally with Set up logins."
-        else:
-            message += " Try Set up logins if the article is subscriber-only."
+        has_cookies = cookies_file().exists()
+        message = "No images found in page HTML."
+        if not has_cookies:
+            message += " Paste subscriber cookies below for NYT/WSJ/WaPo articles."
         return {"ok": False, "error": message}
 
-    count = _download_images(image_urls, folder, referer=url)
+    count = _download_images(image_urls, folder, referer=url, session=session)
     if count == 0:
         return {
             "ok": False,
@@ -366,10 +344,9 @@ def scrape_images(url: str) -> dict:
     }
 
     if is_serverless():
-        zip_path = _create_zip(folder)
+        _create_zip(folder)
         result["zip_url"] = f"/download/{folder.name}.zip"
         result["folder"] = f"{count} images ready to download"
-        result["zip_path"] = str(zip_path)
 
     return result
 
