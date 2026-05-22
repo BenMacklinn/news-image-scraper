@@ -4,3 +4,4 @@ __pycache__/
 .browser-profile/
 downloads/
 .DS_Store
+.vercel
